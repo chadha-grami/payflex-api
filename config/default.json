@@ -1,0 +1,5 @@
+{
+  "service": "payflex-api",
+  "supportedCurrencies": ["EUR", "USD", "TND"],
+  "maxPaymentAmount": 10000
+}

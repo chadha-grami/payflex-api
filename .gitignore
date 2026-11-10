@@ -1,0 +1,10 @@
+node_modules/
+coverage/
+reports/
+.scannerwork/
+artifact-app/
+scan-logs/
+*.log
+__pycache__/
+report
+screenshots

@@ -1,0 +1,11 @@
+node_modules
+coverage
+reports
+.git
+.github
+tests
+k6
+postman
+report
+screenshots
+*.env

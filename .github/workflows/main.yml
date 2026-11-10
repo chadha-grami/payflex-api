@@ -1,0 +1,253 @@
+name: PayFlex CI/CD
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      simulate_latency_ms:
+        description: "Artificial API latency (ms) for the perf test: 0 = normal, 300 = warning, 600 = critical"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  GITLEAKS_VERSION: "8.18.4"
+
+jobs:
+  # ---------------------------------------------------------------- 1
+  secrets-source:
+    name: 1 - Secrets scan (source and config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+      - name: Scan source code and configuration files
+        run: |
+          mkdir -p reports
+          gitleaks detect --source . --no-git --config .gitleaks.toml --redact --no-banner \
+            --report-format json --report-path reports/gitleaks-source.json --exit-code 0
+      - name: Quality gate (confidentiality - source)
+        run: python3 scripts/quality_gate.py --stage secrets-source
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-secrets-source
+          path: reports/
+
+  # ---------------------------------------------------------------- 2
+  unit-tests:
+    name: 2 - Unit tests and coverage
+    needs: secrets-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Run Jest with coverage
+        run: bash scripts/run_unit.sh
+      - name: Quality gate (unit tests and coverage)
+        run: python3 scripts/quality_gate.py --stage unit
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-unit
+          path: reports/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  # ---------------------------------------------------------------- 3
+  sonar:
+    name: 3 - SonarQube analysis
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: coverage
+      - name: Start ephemeral SonarQube Community
+        id: sq
+        run: bash scripts/sonar_start.sh
+      - name: Run sonar-scanner
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ steps.sq.outputs.token }}
+          SONAR_HOST_URL: http://localhost:9000
+      - name: Export Sonar metrics
+        env:
+          SONAR_TOKEN: ${{ steps.sq.outputs.token }}
+        run: bash scripts/sonar_fetch.sh
+      - name: Quality gate (SonarQube)
+        run: python3 scripts/quality_gate.py --stage sonar
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-sonar
+          path: reports/
+
+  # ---------------------------------------------------------------- 4
+  integration-tests:
+    name: 4 - Integration tests (Docker + Newman)
+    needs: sonar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Build Docker image
+        run: docker build -t payflex-api:ci .
+      - name: Start ephemeral container
+        run: |
+          docker run -d --name payflex -p 3000:3000 payflex-api:ci
+          for i in $(seq 1 30); do curl -sf http://localhost:3000/health && break; sleep 1; done
+      - name: Run Newman scenario
+        run: |
+          mkdir -p reports
+          npm install -g newman
+          newman run postman/payflex.postman_collection.json \
+            --env-var baseUrl=http://localhost:3000 \
+            -r cli,json --reporter-json-export reports/newman-report.json \
+            | tee reports/newman-cli.log || true
+      - name: Collect container logs
+        if: always()
+        run: docker logs payflex > reports/container-integration.log 2>&1 || true
+      - name: Quality gate (integration)
+        run: python3 scripts/quality_gate.py --stage integration
+      - name: Save image for next stages
+        run: docker save payflex-api:ci | gzip > payflex-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-integration
+          path: reports/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: payflex-image
+          path: payflex-image.tar.gz
+          retention-days: 1
+
+  # ---------------------------------------------------------------- 5
+  performance-tests:
+    name: 5 - Performance tests (k6)
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: payflex-image
+      - run: docker load < payflex-image.tar.gz
+      - name: Start container (optional simulated latency)
+        run: |
+          docker run -d --name payflex -p 3000:3000 \
+            -e SIMULATED_LATENCY_MS=${{ github.event.inputs.simulate_latency_ms || '0' }} payflex-api:ci
+          for i in $(seq 1 30); do curl -sf http://localhost:3000/health && break; sleep 1; done
+      - uses: grafana/setup-k6-action@v1
+      - name: Run k6 load test
+        run: |
+          mkdir -p reports
+          k6 run k6/load-test.js | tee reports/k6-output.log || true
+      - name: Collect container logs
+        if: always()
+        run: docker logs payflex > reports/container-perf.log 2>&1 || true
+      - name: Quality gate (performance)
+        run: python3 scripts/quality_gate.py --stage perf
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-perf
+          path: reports/
+
+  # ---------------------------------------------------------------- 6
+  secrets-artifacts:
+    name: 6 - Confidentiality rate (artifact and logs)
+    needs: performance-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*
+          path: reports
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: payflex-image
+      - name: Extract the build artifact (application folder of the image)
+        run: |
+          docker load < payflex-image.tar.gz
+          docker create --name tmp payflex-api:ci
+          docker cp tmp:/app ./artifact-app
+      - name: Gather logs to scan
+        run: |
+          mkdir -p scan-logs
+          cp reports/container-*.log reports/newman-cli.log reports/k6-output.log scan-logs/
+      - name: Scan build artifact and logs
+        run: |
+          gitleaks detect --source artifact-app --no-git --config .gitleaks.toml --redact --no-banner \
+            --report-format json --report-path reports/gitleaks-artifact.json --exit-code 0
+          gitleaks detect --source scan-logs --no-git --config .gitleaks.toml --redact --no-banner \
+            --report-format json --report-path reports/gitleaks-logs.json --exit-code 0
+      - name: Quality gate (Confidentiality rate)
+        run: python3 scripts/quality_gate.py --stage confidentiality
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-confidentiality
+          path: |
+            reports/gate-confidentiality.json
+            reports/incident-confidentiality.md
+            reports/gitleaks-*.json
+
+  # ---------------------------------------------------------------- report
+  report:
+    name: Pipeline report
+    if: always()
+    needs: [secrets-source, unit-tests, sonar, integration-tests, performance-tests, secrets-artifacts]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reports-*
+          path: reports
+          merge-multiple: true
+      - name: Build summary and incident report
+        run: python3 scripts/quality_gate.py --stage summary
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-report
+          path: reports/pipeline-report.md
+
+  # ---------------------------------------------------------------- deploy
+  deploy:
+    name: 7 - Deploy to production
+    needs: secrets-artifacts
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy (simulated)
+        run: |
+          echo "All quality gates passed -> deploying ${GITHUB_SHA::8} to production (simulated)."
+          echo "### 🚀 Deployed to production: ${GITHUB_SHA::8}" >> "$GITHUB_STEP_SUMMARY"
